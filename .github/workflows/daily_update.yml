@@ -1,0 +1,37 @@
+name: Update NSE Dashboard
+
+on:
+  schedule:
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch: 
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Dashboard Script
+        run: |
+          python update_dashboard.py
+
+      - name: Commit and Push new HTML
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Automated daily dashboard update" || exit 0
+          git push
