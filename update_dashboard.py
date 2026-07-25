@@ -1,134 +1,190 @@
 import os
+import time
 import glob
 import json
-import pandas as pd
-import requests
 import io
-from datetime import timedelta
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
-DATA_DIR = "NSE_Cash_Bhavcopies_12M"
+SAVE_DIR = "NSE_Cash_Bhavcopies_12M"
 OUTPUT_HTML = "index.html"
 
-# ==========================================
-# 1. FETCH NIFTY 500 LIST & SECTORS
-# ==========================================
-print("1. Fetching Nifty 500 List from NSE...")
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "text/csv,text/html,application/xhtml+xml,application/xml",
+# Common Headers for NSE Requests
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/"
 }
-nifty500_url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-sector_map = {}
-nifty500_symbols = set()
 
-try:
+# ==========================================
+# STEP 1: DOWNLOAD MISSING CASH BHAVCOPIES
+# ==========================================
+def download_bhavcopies():
+    print("=== STEP 1: DOWNLOADING NSE CASH BHAVCOPIES ===")
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
     session = requests.Session()
-    session.headers.update(headers)
-    session.get("https://www.nseindia.com", timeout=10) 
-    response = session.get(nifty500_url, timeout=10)
-    
-    if response.status_code == 200:
-        df_n500 = pd.read_csv(io.StringIO(response.text))
-        df_n500['Symbol'] = df_n500['Symbol'].astype(str).str.strip()
-        df_n500['Industry'] = df_n500['Industry'].astype(str).str.strip()
-        sector_map = dict(zip(df_n500['Symbol'], df_n500['Industry']))
-        nifty500_symbols = set(df_n500['Symbol'])
-        print(f"   -> Successfully fetched {len(nifty500_symbols)} Nifty 500 stocks.")
-    else:
-        print(f"   -> Warning: Failed to fetch Nifty 500 list (Status {response.status_code}).")
-except Exception as e:
-    print(f"   -> Warning: Exception fetching Nifty 500: {e}")
+    session.headers.update(HEADERS)
 
-# ==========================================
-# 2. LOAD 12-MONTH DATA
-# ==========================================
-print("2. Loading and cleaning Cash Market CSV files...")
-csv_files = glob.glob(os.path.join(DATA_DIR, "sec_bhavdata_full_*.csv"))
-
-if not csv_files:
-    raise FileNotFoundError(f"No CSV files found in {DATA_DIR}. Please download them first.")
-
-df_list = []
-for f in csv_files:
+    print("Initializing session and fetching cookies from NSE...")
     try:
-        temp_df = pd.read_csv(f)
-        temp_df.columns = temp_df.columns.str.strip()
-        if 'SYMBOL' in temp_df.columns: temp_df['SYMBOL'] = temp_df['SYMBOL'].astype(str).str.strip()
-        if 'SERIES' in temp_df.columns: temp_df['SERIES'] = temp_df['SERIES'].astype(str).str.strip()
-        df_list.append(temp_df)
-    except Exception:
-        continue
+        session.get("https://www.nseindia.com", timeout=10)
+        print("Session established successfully.\n")
+    except Exception as e:
+        print(f"Warning: Could not fetch initial cookies: {e}\n")
 
-df = pd.concat(df_list, ignore_index=True)
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=365)
+    business_days = pd.date_range(start=start_date, end=end_date, freq='B')
 
-# Clean numeric & date columns
-numeric_cols = ['OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE', 'TTL_TRD_QNTY', 'DELIV_QTY', 'DELIV_PER']
-for col in numeric_cols:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col].astype(str).str.replace('-', '0').str.strip(), errors='coerce').fillna(0)
+    print(f"Checking data for {len(business_days)} potential trading days...")
+    successful_downloads = 0
+    already_existed = 0
 
-df['DATE1'] = pd.to_datetime(df['DATE1'].astype(str).str.strip(), format='%d-%b-%Y', errors='coerce')
-df = df.dropna(subset=['DATE1']).sort_values('DATE1')
+    for date in business_days:
+        date_str = date.strftime('%d%m%Y')
+        filename = f"sec_bhavdata_full_{date_str}.csv"
+        file_path = os.path.join(SAVE_DIR, filename)
 
-df['SECTOR'] = df['SYMBOL'].map(sector_map).fillna('Other')
-df['IS_NIFTY500'] = df['SYMBOL'].isin(nifty500_symbols)
+        # Skip if file already downloaded
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 1000:
+            already_existed += 1
+            continue
+
+        url = f"https://archives.nseindia.com/products/content/{filename}"
+
+        try:
+            response = session.get(url, timeout=10)
+            if response.status_code == 200:
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+                print(f"[SUCCESS] Downloaded: {filename}")
+                successful_downloads += 1
+            elif response.status_code == 404:
+                print(f"[SKIPPED] Market Holiday / No file: {date.strftime('%Y-%m-%d')}")
+            elif response.status_code == 403:
+                print(f"[BLOCKED] 403 Forbidden on {date.strftime('%Y-%m-%d')}. Rate limit reached.")
+                break
+            else:
+                print(f"[ERROR] Failed {date.strftime('%Y-%m-%d')} - Status Code: {response.status_code}")
+        except Exception as e:
+            print(f"[ERROR] Exception on {date.strftime('%Y-%m-%d')}: {e}")
+
+        time.sleep(1) # Friendly sleep to avoid rate limits
+
+    print(f"Download Summary: {already_existed} existing, {successful_downloads} newly downloaded.\n")
 
 # ==========================================
-# 3. COMPUTE BASE METRICS
+# STEP 2: FETCH NIFTY 500 LIST & SECTORS
 # ==========================================
-print("3. Computing baseline 7-day & 30-day metrics...")
-max_date = df['DATE1'].max()
-last_7d = max_date - timedelta(days=7)
-last_30d = max_date - timedelta(days=30)
+def fetch_nifty500():
+    print("=== STEP 2: FETCHING NIFTY 500 LIST & SECTORS ===")
+    nifty500_url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    sector_map = {}
+    nifty500_symbols = set()
 
-df_7d = df[df['DATE1'] >= last_7d]
-df_30d = df[df['DATE1'] >= last_30d]
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        session.get("https://www.nseindia.com", timeout=10)
+        response = session.get(nifty500_url, timeout=10)
 
-screener = df_30d.groupby(['SYMBOL', 'SERIES']).agg(
-    latest_close=('CLOSE_PRICE', 'last'),
-    avg_deliv_qty_30d=('DELIV_QTY', 'mean'),
-    avg_deliv_pct_30d=('DELIV_PER', 'mean'),
-    SECTOR=('SECTOR', 'last'),
-    IS_NIFTY500=('IS_NIFTY500', 'last')
-).reset_index()
+        if response.status_code == 200:
+            df_n500 = pd.read_csv(io.StringIO(response.text))
+            df_n500['Symbol'] = df_n500['Symbol'].astype(str).str.strip()
+            df_n500['Industry'] = df_n500['Industry'].astype(str).str.strip()
+            sector_map = dict(zip(df_n500['Symbol'], df_n500['Industry']))
+            nifty500_symbols = set(df_n500['Symbol'])
+            print(f"Successfully fetched {len(nifty500_symbols)} Nifty 500 stocks.\n")
+        else:
+            print(f"Warning: Failed to fetch Nifty 500 list (Status {response.status_code}).\n")
+    except Exception as e:
+        print(f"Warning: Exception fetching Nifty 500: {e}\n")
 
-screener_7d = df_7d.groupby(['SYMBOL', 'SERIES']).agg(
-    avg_deliv_qty_7d=('DELIV_QTY', 'mean'),
-    avg_deliv_pct_7d=('DELIV_PER', 'mean')
-).reset_index()
+    return sector_map, nifty500_symbols
 
-screener = pd.merge(screener, screener_7d, on=['SYMBOL', 'SERIES'], how='left').fillna(0)
-screener = screener.round({
-    'latest_close': 2, 'avg_deliv_pct_30d': 2, 'avg_deliv_pct_7d': 2, 
-    'avg_deliv_qty_30d': 0, 'avg_deliv_qty_7d': 0
-})
+# ==========================================
+# STEP 3: PROCESS DATA & BUILD DASHBOARD
+# ==========================================
+def build_dashboard(sector_map, nifty500_symbols):
+    print("=== STEP 3: PROCESSING DATA & BUILDING INDEX.HTML ===")
+    csv_files = glob.glob(os.path.join(SAVE_DIR, "sec_bhavdata_full_*.csv"))
 
-print("4. Structuring Data for Frontend Z-Score Engine...")
-series_list = sorted(df['SERIES'].unique().tolist())
-sector_list = sorted([s for s in screener['SECTOR'].unique() if s != 'Other'])
-screener_json = screener.to_dict(orient='records')
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found in {SAVE_DIR}.")
 
-# Build comprehensive time-series dictionary for charts and dynamic Z-score calculations
-chart_data = {}
-for (symbol, series), group in df.groupby(['SYMBOL', 'SERIES']):
-    if series not in chart_data:
-        chart_data[series] = {}
-    chart_data[series][symbol] = {
-        'd': group['DATE1'].dt.strftime('%Y-%m-%d').tolist(),
-        'c': group['CLOSE_PRICE'].tolist(),
-        'dq': group['DELIV_QTY'].tolist()
-    }
+    df_list = []
+    for f in csv_files:
+        try:
+            temp_df = pd.read_csv(f)
+            temp_df.columns = temp_df.columns.str.strip()
+            if 'SYMBOL' in temp_df.columns: temp_df['SYMBOL'] = temp_df['SYMBOL'].astype(str).str.strip()
+            if 'SERIES' in temp_df.columns: temp_df['SERIES'] = temp_df['SERIES'].astype(str).str.strip()
+            df_list.append(temp_df)
+        except Exception:
+            continue
 
-print("5. Generating the UI HTML...")
+    df = pd.concat(df_list, ignore_index=True)
 
-# =========================================
-# HTML TEMPLATE WITH JS Z-SCORE ENGINE
-# =========================================
-html_content = f"""<!DOCTYPE html>
+    numeric_cols = ['OPEN_PRICE', 'HIGH_PRICE', 'LOW_PRICE', 'CLOSE_PRICE', 'TTL_TRD_QNTY', 'DELIV_QTY', 'DELIV_PER']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace('-', '0').str.strip(), errors='coerce').fillna(0)
+
+    df['DATE1'] = pd.to_datetime(df['DATE1'].astype(str).str.strip(), format='%d-%b-%Y', errors='coerce')
+    df = df.dropna(subset=['DATE1']).sort_values('DATE1')
+
+    df['SECTOR'] = df['SYMBOL'].map(sector_map).fillna('Other')
+    df['IS_NIFTY500'] = df['SYMBOL'].isin(nifty500_symbols)
+
+    max_date = df['DATE1'].max()
+    last_7d = max_date - timedelta(days=7)
+    last_30d = max_date - timedelta(days=30)
+
+    df_7d = df[df['DATE1'] >= last_7d]
+    df_30d = df[df['DATE1'] >= last_30d]
+
+    screener = df_30d.groupby(['SYMBOL', 'SERIES']).agg(
+        latest_close=('CLOSE_PRICE', 'last'),
+        avg_deliv_qty_30d=('DELIV_QTY', 'mean'),
+        avg_deliv_pct_30d=('DELIV_PER', 'mean'),
+        SECTOR=('SECTOR', 'last'),
+        IS_NIFTY500=('IS_NIFTY500', 'last')
+    ).reset_index()
+
+    screener_7d = df_7d.groupby(['SYMBOL', 'SERIES']).agg(
+        avg_deliv_qty_7d=('DELIV_QTY', 'mean'),
+        avg_deliv_pct_7d=('DELIV_PER', 'mean')
+    ).reset_index()
+
+    screener = pd.merge(screener, screener_7d, on=['SYMBOL', 'SERIES'], how='left').fillna(0)
+    screener = screener.round({
+        'latest_close': 2, 'avg_deliv_pct_30d': 2, 'avg_deliv_pct_7d': 2, 
+        'avg_deliv_qty_30d': 0, 'avg_deliv_qty_7d': 0
+    })
+
+    series_list = sorted(df['SERIES'].unique().tolist())
+    sector_list = sorted([s for s in screener['SECTOR'].unique() if s != 'Other'])
+    screener_json = screener.to_dict(orient='records')
+
+    chart_data = {}
+    for (symbol, series), group in df.groupby(['SYMBOL', 'SERIES']):
+        if series not in chart_data:
+            chart_data[series] = {}
+        chart_data[series][symbol] = {
+            'd': group['DATE1'].dt.strftime('%Y-%m-%d').tolist(),
+            'c': group['CLOSE_PRICE'].tolist(),
+            'dq': group['DELIV_QTY'].tolist()
+        }
+
+    html_content = f"""<!DOCTYPE html>
 <html lang="en" data-bs-theme="light">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NSE Pro Analytics Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css" rel="stylesheet">
@@ -173,9 +229,7 @@ html_content = f"""<!DOCTYPE html>
 
 <div class="container-fluid">
     <div class="row">
-        <!-- Main Content Area -->
         <div class="col-lg-9">
-            
             <ul class="nav nav-tabs mb-3" id="myTab">
               <li class="nav-item"><a class="nav-link active" data-mode="all">🌐 All Market</a></li>
               <li class="nav-item"><a class="nav-link" data-mode="nifty500">★ Nifty 500</a></li>
@@ -194,7 +248,6 @@ html_content = f"""<!DOCTYPE html>
             <div class="card p-3">
                 <h5 class="border-bottom pb-2 mb-3">Master Screener & Filters</h5>
                 
-                <!-- ALL LINKED FILTERS -->
                 <div class="row g-2 mb-2">
                     <div class="col-md-3">
                         <label class="form-label fw-bold small mb-1">Series</label>
@@ -263,7 +316,6 @@ html_content = f"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Side Panel Area -->
         <div class="col-lg-3">
             <div class="card p-3 mb-3 sticky-top" style="top: 20px;">
                 <div class="border-bottom fw-bold pb-2 mb-3">Search & Select Stock</div>
@@ -299,10 +351,6 @@ html_content = f"""<!DOCTYPE html>
     let dataTable;
     let currentTabMode = 'all';
 
-    // =====================================
-    // MATH ENGINE (Runs entirely in browser)
-    // =====================================
-    
     function getPearson(x, y) {{
         let n = Math.min(x.length, y.length);
         if (n < 2) return 0;
@@ -333,7 +381,7 @@ html_content = f"""<!DOCTYPE html>
 
     function calculateAllZScores() {{
         const months = parseInt($('#zLookback').val()) || 6;
-        const lookbackDays = months * 21; // Approx trading days
+        const lookbackDays = months * 21;
         
         screenerData.forEach(row => {{
             const series = row.SERIES;
@@ -366,21 +414,14 @@ html_content = f"""<!DOCTYPE html>
         return v > 0.2 ? `<span class="correlation-positive">${{n}}</span>` : (v < -0.2 ? `<span class="correlation-negative">${{n}}</span>` : `<span>${{n}}</span>`);
     }}
 
-    // =====================================
-    // DATATABLES & FILTER LOGIC
-    // =====================================
-    
     $.fn.dataTable.ext.search.push(function(settings, data, dataIndex, rowData) {{
-        // Tab Mode Filtering
         if (currentTabMode === 'nifty500' && !rowData.IS_NIFTY500) return false;
         
-        // Exact Category Filters
         const seriesF = $('#seriesFilter').val();
         if (seriesF && rowData.SERIES !== seriesF) return false;
         const sec = $('#sectorFilter').val();
         if (sec && rowData.SECTOR !== sec) return false;
 
-        // Metric Logic Filters
         const min_dq7 = parseFloat($('#f_dq7').val()) || 0;
         const min_dq30 = parseFloat($('#f_dq30').val()) || 0;
         const min_dp7 = parseFloat($('#f_dp7').val()) || 0;
@@ -409,7 +450,7 @@ html_content = f"""<!DOCTYPE html>
                 {{ data: 'z_dq', render: function(d) {{ return formatZScore(d); }} }}
             ],
             pageLength: 10,
-            order: [[8, 'desc']], // Default: Show strongest Delivery Z-Score outliers first
+            order: [[8, 'desc']],
             dom: '<"row"<"col-sm-12 col-md-6"l><"col-sm-12 col-md-6"f>>rt<"row"<"col-sm-12 col-md-5"i><"col-sm-12 col-md-7"p>>'
         }});
         
@@ -468,15 +509,10 @@ html_content = f"""<!DOCTYPE html>
         }}, {{responsive: true}});
     }}
 
-    // =====================================
-    // EVENT LISTENERS
-    // =====================================
     $(document).ready(function() {{
-        // Setup backend logic & load UI
         calculateAllZScores();
         initTable();
         
-        // Tab switching logic (Now restricted strictly to 'all' vs 'nifty500')
         $('.nav-link').on('click', function (e) {{
             e.preventDefault();
             $('.nav-link').removeClass('active'); $(this).addClass('active');
@@ -485,32 +521,27 @@ html_content = f"""<!DOCTYPE html>
             populateDropdown();
         }});
 
-        // Trigger filters instantly as user types or selects
         $('#f_dq7, #f_dq30, #f_dp7, #f_dp30, #sectorFilter, #seriesFilter').on('input change', function() {{ 
             dataTable.draw(); populateDropdown(); 
         }});
         
-        // Recalculate all Z-Scores globally on lookback change
         $('#zLookback').on('change', function() {{
             calculateAllZScores();
             populateDropdown();
         }});
 
-        // Clear all states
         $('#resetFilters').click(function() {{ 
             $('#f_dq7, #f_dq30, #f_dp7, #f_dp30, #sectorFilter').val(''); 
             $('#zLookback').val('6'); calculateAllZScores();
             dataTable.draw(); populateDropdown(); 
         }});
         
-        // Chart refresh bindings
         $('#stockFilter').on('change', updateDashboard);
         $('#themeToggle').on('change', function() {{ 
             document.documentElement.setAttribute('data-bs-theme', this.checked ? 'dark' : 'light'); 
             updateDashboard(); 
         }});
         
-        // Apply EQ filter immediately on first load
         if ($('#seriesFilter option[value="EQ"]').length > 0) $('#seriesFilter').val('EQ');
         dataTable.draw(); 
         populateDropdown();
@@ -520,7 +551,16 @@ html_content = f"""<!DOCTYPE html>
 </html>
 """
 
-with open(OUTPUT_HTML, "w", encoding="utf-8") as file:
-    file.write(html_content)
+    with open(OUTPUT_HTML, "w", encoding="utf-8") as file:
+        file.write(html_content)
 
-print(f"\n[SUCCESS] The Dashboard is finalized (2 Tabs, Fully integrated Z-Scores): {os.path.abspath(OUTPUT_HTML)}")
+    print(f"Successfully generated {OUTPUT_HTML}!\n")
+
+# ==========================================
+# MAIN EXECUTION FLOW
+# ==========================================
+if __name__ == "__main__":
+    download_bhavcopies()
+    sector_map, nifty500_symbols = fetch_nifty500()
+    build_dashboard(sector_map, nifty500_symbols)
+    print("ALL STEPS COMPLETED SUCCESSFULLY!")
